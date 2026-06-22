@@ -222,6 +222,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_default_config() {
         let default_config = AppConfig::default();
@@ -235,6 +237,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_config() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         let path = get_config_path();
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -260,6 +263,7 @@ mod tests {
 
     #[test]
     fn test_update_config() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         init();
         let update_val = json!({
             "theme": "light",
