@@ -1,0 +1,3 @@
+# Keychron Link (USB) and Keychron V5 Max (USB/Bluetooth)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", MODE="0660", GROUP="users", TAG+="uaccess", TAG+="udev-acl"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="*:3434:*", MODE="0660", GROUP="users", TAG+="uaccess", TAG+="udev-acl"
