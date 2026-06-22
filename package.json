@@ -12,7 +12,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:coverage": "cargo tarpaulin --ignore-tests"
   },
   "dependencies": {
     "react": "^19.1.0",
