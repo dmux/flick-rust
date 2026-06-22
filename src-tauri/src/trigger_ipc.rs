@@ -96,6 +96,31 @@ pub async fn relay_trigger_on_port(key: &str, port: u16) -> bool {
     }
 }
 
+pub struct TcpTriggerIpcService;
+
+impl crate::ports::TriggerIpcService for TcpTriggerIpcService {
+    fn start_server(&self, port: u16, on_trigger: Box<dyn Fn(String) + Send + Sync + 'static>) {
+        let rt = tokio::runtime::Handle::current();
+        rt.spawn(async move {
+            start_trigger_server_on_port(move |key| {
+                on_trigger(key);
+            }, port).await;
+        });
+    }
+
+    fn relay_trigger(&self, key: &str, port: u16) -> bool {
+        let key_str = key.to_string();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(relay_trigger_on_port(&key_str, port))
+        });
+        handle.join().unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -216,6 +216,14 @@ pub fn list_keychron_devices() -> Vec<KeychronDevice> {
     by_vp.into_values().collect()
 }
 
+pub struct HidApiService;
+
+impl crate::ports::HidService for HidApiService {
+    fn list_devices(&self) -> Vec<KeychronDevice> {
+        list_keychron_devices()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

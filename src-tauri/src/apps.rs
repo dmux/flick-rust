@@ -533,6 +533,20 @@ pub fn launch_url(url: &str) {
     }
 }
 
+pub struct ProcessAppLauncher;
+
+impl crate::ports::AppLauncher for ProcessAppLauncher {
+    fn launch_app(&self, exec_cmd: &str) {
+        launch_app(exec_cmd);
+    }
+    fn launch_url(&self, url: &str) {
+        launch_url(url);
+    }
+    fn list_apps(&self) -> Vec<AppInfo> {
+        list_installed_apps_with_icons()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::accept_async;
@@ -6,8 +7,8 @@ use futures_util::{StreamExt, SinkExt};
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
-use crate::config::{get_config, update_config, QuickStartOption};
-use crate::apps::list_installed_apps_with_icons;
+use crate::config::QuickStartOption;
+use crate::apps::AppInfo;
 
 const ASSIST_VERSION: &str = "1.1.1";
 
@@ -62,17 +63,16 @@ fn get_clients() -> &'static Clients {
     CLIENTS.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
-pub fn broadcast_key_binds() {
+pub fn broadcast_key_binds_adapter(binds: &HashMap<String, Vec<QuickStartOption>>) {
     let clients_guard = get_clients().lock().unwrap();
     if clients_guard.is_empty() {
         return;
     }
-    let config = get_config();
     let payload = OutMessage {
         evt_type: "QuickStart".to_string(),
         evt_data: OutData {
             cmd: "GetKeyBinds".to_string(),
-            data: serde_json::to_value(vec![config.quick_start_binds]).unwrap_or(Value::Null),
+            data: serde_json::to_value(vec![binds]).unwrap_or(Value::Null),
         },
     };
     if let Ok(msg_str) = serde_json::to_string(&payload) {
@@ -83,10 +83,61 @@ pub fn broadcast_key_binds() {
     }
 }
 
-pub async fn start_server<F>(port: u16, on_key_binds_changed: F)
-where
-    F: Fn() + Send + Sync + Clone + 'static,
-{
+struct WsCallbacks {
+    on_get_binds: Box<dyn Fn() -> HashMap<String, Vec<QuickStartOption>> + Send + Sync + 'static>,
+    on_add_bind: Box<dyn Fn(String, QuickStartOption) + Send + Sync + 'static>,
+    on_clear_bind: Box<dyn Fn(Option<String>) + Send + Sync + 'static>,
+    on_get_apps: Box<dyn Fn() -> Vec<AppInfo> + Send + Sync + 'static>,
+}
+
+type SharedCallbacks = Arc<RwLock<Option<Arc<WsCallbacks>>>>;
+
+pub struct TungsteniteWsServer {
+    callbacks: SharedCallbacks,
+}
+
+impl TungsteniteWsServer {
+    pub fn new() -> Self {
+        Self {
+            callbacks: Arc::new(RwLock::new(None)),
+        }
+    }
+}
+
+impl crate::ports::WsServer for TungsteniteWsServer {
+    fn start(
+        &self,
+        port: u16,
+        on_get_binds: Box<dyn Fn() -> HashMap<String, Vec<QuickStartOption>> + Send + Sync + 'static>,
+        on_add_bind: Box<dyn Fn(String, QuickStartOption) + Send + Sync + 'static>,
+        on_clear_bind: Box<dyn Fn(Option<String>) + Send + Sync + 'static>,
+        on_get_apps: Box<dyn Fn() -> Vec<AppInfo> + Send + Sync + 'static>,
+    ) {
+        let callbacks_arc = Arc::new(WsCallbacks {
+            on_get_binds,
+            on_add_bind,
+            on_clear_bind,
+            on_get_apps,
+        });
+        *self.callbacks.write().unwrap() = Some(callbacks_arc);
+
+        let callbacks = self.callbacks.clone();
+        let rt = tokio::runtime::Handle::current();
+        rt.spawn(async move {
+            start_server_internal(port, callbacks).await;
+        });
+    }
+
+    fn broadcast_binds(&self, binds: &HashMap<String, Vec<QuickStartOption>>) {
+        broadcast_key_binds_adapter(binds);
+    }
+}
+
+fn get_callbacks(shared: &SharedCallbacks) -> Option<Arc<WsCallbacks>> {
+    shared.read().unwrap().clone()
+}
+
+async fn start_server_internal(port: u16, callbacks: SharedCallbacks) {
     let addr = format!("127.0.0.1:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -97,58 +148,54 @@ where
     };
     println!("[WS] Keychron-compatible WebSocket server listening on port {}", port);
 
-    let on_key_binds_changed = Arc::new(on_key_binds_changed);
+    while let Ok((stream, _)) = listener.accept().await {
+        let callbacks_clone = callbacks.clone();
+        tokio::spawn(async move {
+            let ws_stream = match accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    eprintln!("[WS] Error during WebSocket handshake: {}", e);
+                    return;
+                }
+            };
+            println!("[WS] Client connected");
 
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let on_key_binds_changed = on_key_binds_changed.clone();
-            tokio::spawn(async move {
-                let ws_stream = match accept_async(stream).await {
-                    Ok(ws) => ws,
-                    Err(e) => {
-                        eprintln!("[WS] Error during WebSocket handshake: {}", e);
-                        return;
-                    }
-                };
-                println!("[WS] Client connected");
+            let (mut ws_write, mut ws_read) = ws_stream.split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
-                let (mut ws_write, mut ws_read) = ws_stream.split();
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            get_clients().lock().unwrap().push(tx);
 
-                get_clients().lock().unwrap().push(tx);
-
-                // Write worker
-                let write_task = tokio::spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        if ws_write.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                // Read worker
-                while let Some(Ok(msg)) = ws_read.next().await {
-                    if let Message::Text(text) = msg {
-                        println!("[WS ↓ launcher] {}", text);
-                        if let Ok(parsed) = serde_json::from_str::<EvtMessage>(&text) {
-                            handle_message(parsed, &on_key_binds_changed).await;
-                        }
+            // Write worker
+            let write_task = tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    if ws_write.send(msg).await.is_err() {
+                        break;
                     }
                 }
-
-                println!("[WS] Client disconnected");
-                write_task.abort();
-                // Clean up sender
-                // Note: ideally we filter out dead senders, but since it's a simple app we can clear on next broadcast or keep clean.
             });
-        }
-    });
+
+            // Read worker
+            while let Some(Ok(msg)) = ws_read.next().await {
+                if let Message::Text(text) = msg {
+                    println!("[WS ↓ launcher] {}", text);
+                    if let Ok(parsed) = serde_json::from_str::<EvtMessage>(&text) {
+                        handle_message(parsed, &callbacks_clone).await;
+                    }
+                }
+            }
+
+            println!("[WS] Client disconnected");
+            write_task.abort();
+        });
+    }
 }
 
-async fn handle_message<F>(msg: EvtMessage, on_key_binds_changed: &Arc<F>)
-where
-    F: Fn() + Send + Sync + 'static,
-{
+async fn handle_message(msg: EvtMessage, callbacks: &SharedCallbacks) {
+    let cb = match get_callbacks(callbacks) {
+        Some(c) => c,
+        None => return,
+    };
+
     let evt_type = msg.evt_type.unwrap_or_default();
     let cmd = msg.evt_data.as_ref().and_then(|d| d.cmd.clone()).unwrap_or_default();
     let data = msg.evt_data.as_ref().and_then(|d| d.data.clone()).unwrap_or(Value::Null);
@@ -169,7 +216,7 @@ where
             }
         }
         "QuickStart" => {
-            handle_quick_start(&cmd, data, on_key_binds_changed).await;
+            handle_quick_start(&cmd, data, &cb).await;
         }
         _ => {
             send_response(&evt_type, &cmd, Value::String("".to_string()));
@@ -177,10 +224,7 @@ where
     }
 }
 
-async fn handle_quick_start<F>(cmd: &str, data: Value, on_key_binds_changed: &Arc<F>)
-where
-    F: Fn() + Send + Sync + 'static,
-{
+async fn handle_quick_start(cmd: &str, data: Value, cb: &Arc<WsCallbacks>) {
     if let Some(s) = data.as_str() {
         if s == "Success" || s == "KeyDuplicate" || s == "Fail" {
             println!("[WS] ignoring QuickStart {} status acknowledgment: {}", cmd, s);
@@ -190,7 +234,12 @@ where
 
     match cmd {
         "Get" => {
-            let apps = tokio::task::spawn_blocking(list_installed_apps_with_icons).await.unwrap_or_default();
+            // run on_get_apps under spawn_blocking
+            let cb_clone = cb.clone();
+            let apps = tokio::task::spawn_blocking(move || {
+                cb_clone.on_get_apps.as_ref()()
+            }).await.unwrap_or_default();
+
             println!("[WS] streaming app basket: {} apps", apps.len());
 
             send_response("QuickStart", "Get", serde_json::json!({
@@ -219,11 +268,10 @@ where
             }));
         }
         "GetKeyBinds" => {
-            let config = get_config();
-            send_response("QuickStart", "GetKeyBinds", serde_json::to_value(vec![config.quick_start_binds]).unwrap());
+            let binds = cb.on_get_binds.as_ref()();
+            send_response("QuickStart", "GetKeyBinds", serde_json::to_value(vec![binds]).unwrap());
         }
         "AddKeyBind" => {
-            // Try to parse binding from payload
             let payload: Result<AddBindPayload, _> = if data.is_string() {
                 serde_json::from_str(data.as_str().unwrap())
             } else {
@@ -231,8 +279,8 @@ where
             };
 
             if let Ok(p) = payload {
-                let config = get_config();
-                let existing = config.quick_start_binds.get(&p.key).and_then(|v| v.first());
+                let binds = cb.on_get_binds.as_ref()();
+                let existing = binds.get(&p.key).and_then(|v| v.first());
                 let duplicate = existing.map_or(false, |e| {
                     e.opt_type == p.bind.opt_type && e.opt_data.path == p.bind.opt_data.path
                 });
@@ -240,11 +288,8 @@ where
                 if duplicate {
                     println!("[WS] bind for {} is already up to date", p.key);
                 } else {
-                    let mut binds = config.quick_start_binds.clone();
-                    binds.insert(p.key.clone(), vec![p.bind.clone()]);
-                    update_config(serde_json::json!({ "quickStartBinds": binds }));
+                    cb.on_add_bind.as_ref()(p.key.clone(), p.bind.clone());
                     println!("[WS] saved bind {} -> {}", p.key, p.bind.opt_type);
-                    on_key_binds_changed();
                 }
             }
 
@@ -258,16 +303,12 @@ where
             };
 
             if payload_str.to_uppercase().starts_with('F') && payload_str.len() > 1 && payload_str[1..].parse::<u32>().is_ok() {
-                let config = get_config();
-                let mut binds = config.quick_start_binds.clone();
-                binds.remove(&payload_str);
-                update_config(serde_json::json!({ "quickStartBinds": binds }));
+                cb.on_clear_bind.as_ref()(Some(payload_str.clone()));
                 println!("[WS] cleared bind for key: {}", payload_str);
             } else {
-                update_config(serde_json::json!({ "quickStartBinds": {} }));
+                cb.on_clear_bind.as_ref()(None);
                 println!("[WS] cleared all binds");
             }
-            on_key_binds_changed();
             send_response("QuickStart", "ClearKeyBind", Value::String("Success".to_string()));
         }
         "RemoveKeyBind" | "DelKeyBind" | "DeleteKeyBind" => {
@@ -278,12 +319,8 @@ where
             };
 
             if let Ok(p) = payload {
-                let config = get_config();
-                let mut binds = config.quick_start_binds.clone();
-                binds.remove(&p.key);
-                update_config(serde_json::json!({ "quickStartBinds": binds }));
+                cb.on_clear_bind.as_ref()(Some(p.key.clone()));
                 println!("[WS] cleared bind for key: {}", p.key);
-                on_key_binds_changed();
             }
             send_response("QuickStart", cmd, Value::String("Success".to_string()));
         }

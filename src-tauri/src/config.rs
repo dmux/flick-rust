@@ -62,7 +62,7 @@ impl Default for AppConfig {
 static CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 
 fn get_config_dir() -> PathBuf {
-    if cfg!(test) {
+    if cfg!(test) || std::env::var("CARGO_MANIFEST_DIR").is_ok() {
         let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         path.push("target");
         path.push("flick_test");
@@ -144,7 +144,12 @@ pub fn init() {
     // Save initial / migrated config
     let _ = save_config_internal(&config);
 
-    let _ = CONFIG.set(RwLock::new(config));
+    if let Some(rw) = CONFIG.get() {
+        let mut write_guard = rw.write().unwrap();
+        *write_guard = config;
+    } else {
+        let _ = CONFIG.set(RwLock::new(config));
+    }
 }
 
 fn save_config_internal(config: &AppConfig) -> Result<(), std::io::Error> {
@@ -191,6 +196,25 @@ pub fn update_config(update: serde_json::Value) -> AppConfig {
     }
 
     write_guard.clone()
+}
+
+pub struct FsConfigRepository;
+
+impl crate::ports::ConfigRepository for FsConfigRepository {
+    fn load(&self) -> AppConfig {
+        get_config()
+    }
+    fn save(&self, config: &AppConfig) -> Result<(), std::io::Error> {
+        // Update the global static CONFIG as well to stay in sync if needed,
+        // but since we save to disk, we can update the lock:
+        if let Some(rw) = CONFIG.get() {
+            let mut write_guard = rw.write().unwrap();
+            *write_guard = config.clone();
+        } else {
+            let _ = CONFIG.set(RwLock::new(config.clone()));
+        }
+        save_config_internal(config)
+    }
 }
 
 #[cfg(test)]

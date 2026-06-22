@@ -144,6 +144,21 @@ pub fn clear_gnome_shortcuts_sync() {
     }
 }
 
+pub struct GSettingsGnomeShortcutsService;
+
+impl crate::ports::GnomeShortcutsService for GSettingsGnomeShortcutsService {
+    fn is_gnome(&self) -> bool {
+        is_gnome_session()
+    }
+    fn sync_shortcuts(&self, keys: &[String]) -> Result<(), std::io::Error> {
+        sync_gnome_shortcuts(keys)
+    }
+    fn clear_shortcuts(&self) -> Result<(), std::io::Error> {
+        clear_gnome_shortcuts_sync();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

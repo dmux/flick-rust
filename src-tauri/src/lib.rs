@@ -5,15 +5,17 @@ pub mod gnome_shortcuts;
 pub mod trigger_ipc;
 pub mod hid;
 pub mod bridge_ws;
+pub mod ports;
+pub mod domain;
 
 use tauri::{Manager, Emitter};
 use tauri::menu::{Menu, MenuItem, CheckMenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use std::sync::Mutex;
+use std::sync::Arc;
 use serde_json::Value;
 
 pub struct AppState {
-    pub current_view: Mutex<String>,
+    pub core: Arc<crate::domain::FlickCore>,
     pub hid_manager: crate::hid::HidManager,
 }
 
@@ -25,49 +27,61 @@ fn hid_key_id_to_f_key(key_id: u8) -> Option<String> {
     Some(format!("F{}", 12 + key_id))
 }
 
-fn fire_quick_start(key: &str, app_handle: &tauri::AppHandle) {
-    let key_upper = key.to_uppercase();
-    if key_upper == "FOCUS" {
-        if let Some(main_window) = app_handle.get_webview_window("main") {
+pub struct TauriWindowService {
+    app_handle: tauri::AppHandle,
+}
+
+impl TauriWindowService {
+    pub fn new(app_handle: tauri::AppHandle) -> Self {
+        Self { app_handle }
+    }
+}
+
+impl crate::ports::WindowService for TauriWindowService {
+    fn show_and_focus(&self) {
+        if let Some(main_window) = self.app_handle.get_webview_window("main") {
             let _ = main_window.show();
             let _ = main_window.set_focus();
         }
-        return;
     }
-    static LAST_FIRED: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
-    {
-        let mut last_fired = LAST_FIRED.lock().unwrap();
-        if let Some((ref last_key, last_time)) = *last_fired {
-            if last_key == &key_upper && last_time.elapsed() < std::time::Duration::from_millis(400) {
-                println!("[trigger] {} debounced (duplicate within 400ms)", key_upper);
-                return;
+    fn hide(&self) {
+        if let Some(main_window) = self.app_handle.get_webview_window("main") {
+            let _ = main_window.hide();
+        }
+    }
+    fn minimize(&self) {
+        if let Some(main_window) = self.app_handle.get_webview_window("main") {
+            let _ = main_window.minimize();
+        }
+    }
+    fn resize(&self, width: u32, height: u32, mode: &str) {
+        if let Some(main_window) = self.app_handle.get_webview_window("main") {
+            let _ = main_window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width as f64, height as f64)));
+            let _ = main_window.center();
+            if mode == "launcher" {
+                let _ = main_window.set_always_on_top(true);
+                let _ = main_window.set_skip_taskbar(true);
+            } else {
+                let _ = main_window.set_always_on_top(false);
+                let _ = main_window.set_skip_taskbar(false);
             }
         }
-        *last_fired = Some((key_upper.clone(), std::time::Instant::now()));
     }
-
-    let config = crate::config::get_config();
-    if let Some(options) = config.quick_start_binds.get(&key_upper) {
-        println!("[trigger] {} -> launching {} action(s)", key_upper, options.len());
-        for opt in options {
-            let opt = opt.clone();
-            tauri::async_runtime::spawn(async move {
-                if opt.opt_type == "Url" {
-                    crate::apps::launch_url(&opt.opt_data.path);
-                } else {
-                    crate::apps::launch_app(&opt.opt_data.path);
-                }
-            });
+    fn emit_navigate(&self, view: &str) {
+        if let Some(main_window) = self.app_handle.get_webview_window("main") {
+            let _ = main_window.emit("navigate", view);
         }
-    } else {
-        println!("[trigger] {} pressed but no Quick Start bind configured", key_upper);
+    }
+    fn update_tray_menu(&self, autostart: bool) {
+        update_tray_menu(&self.app_handle, autostart);
     }
 }
 
 // Helper to update / rebuild the tray menu
 fn update_tray_menu(app_handle: &tauri::AppHandle, autostart: bool) {
     if let Some(tray) = app_handle.tray_by_id("main_tray") {
-        let config = crate::config::get_config();
+        let state = app_handle.state::<AppState>();
+        let config = state.core.get_config();
         let lang = &config.language;
         let is_en = lang == "en";
         let settings_label = if is_en { "Open Settings" } else { "Abrir Configurações" };
@@ -92,41 +106,23 @@ fn update_tray_menu(app_handle: &tauri::AppHandle, autostart: bool) {
 // Tauri commands implementation
 
 #[tauri::command]
-fn get_config() -> crate::config::AppConfig {
-    crate::config::get_config()
+fn get_config(state: tauri::State<'_, AppState>) -> crate::config::AppConfig {
+    state.core.get_config()
 }
 
 #[tauri::command]
-fn scan_hid() -> Value {
-    let keyboards = crate::hid::list_keychron_devices();
-    let connected = !keyboards.is_empty();
-    serde_json::json!({
-        "connected": connected,
-        "keyboards": keyboards
-    })
+fn scan_hid(state: tauri::State<'_, AppState>) -> Value {
+    state.core.scan_hid()
 }
 
 #[tauri::command]
-fn update_config(config: Value, app_handle: tauri::AppHandle) -> crate::config::AppConfig {
-    let updated = crate::config::update_config(config.clone());
-
-    // Apply side effects
-    if config.get("autostart").is_some() {
-        crate::autostart::set_autostart_enabled(updated.autostart);
-    }
-    if config.get("quickStartBinds").is_some() {
-        let keys: Vec<String> = updated.quick_start_binds.keys().cloned().collect();
-        let _ = crate::gnome_shortcuts::sync_gnome_shortcuts(&keys);
-        crate::bridge_ws::broadcast_key_binds();
-    }
-    
-    update_tray_menu(&app_handle, updated.autostart);
-    updated
+fn update_config(config: Value, state: tauri::State<'_, AppState>) -> crate::config::AppConfig {
+    state.core.update_config(config)
 }
 
 #[tauri::command]
-fn list_apps() -> Vec<crate::apps::AppInfo> {
-    crate::apps::list_installed_apps_with_icons()
+fn list_apps(state: tauri::State<'_, AppState>) -> Vec<crate::apps::AppInfo> {
+    state.core.list_apps()
 }
 
 #[tauri::command]
@@ -135,53 +131,38 @@ fn get_app_version() -> String {
 }
 
 #[tauri::command]
-fn open_external(url: String) {
-    crate::apps::launch_url(&url);
+fn open_external(url: String, state: tauri::State<'_, AppState>) {
+    state.core.open_external(&url);
 }
 
 #[tauri::command]
-fn launch_app(exec_cmd: String, window: tauri::Window) {
-    crate::apps::launch_app(&exec_cmd);
+fn launch_app(exec_cmd: String, window: tauri::Window, state: tauri::State<'_, AppState>) {
+    state.core.launch_app(&exec_cmd);
     let _ = window.hide();
 }
 
 #[tauri::command]
-fn resize_window(width: u32, height: u32, mode: String, window: tauri::Window, state: tauri::State<'_, AppState>) {
-    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width as f64, height as f64)));
-    let _ = window.center();
-    *state.current_view.lock().unwrap() = mode.clone();
-    if mode == "launcher" {
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_skip_taskbar(true);
-    } else {
-        let _ = window.set_always_on_top(false);
-        let _ = window.set_skip_taskbar(false);
-    }
+fn resize_window(width: u32, height: u32, mode: String, state: tauri::State<'_, AppState>) {
+    state.core.resize_window(width, height, &mode);
 }
 
 #[tauri::command]
-fn hide_window(window: tauri::Window) {
-    let _ = window.hide();
+fn hide_window(state: tauri::State<'_, AppState>) {
+    state.core.hide_window();
 }
 
 #[tauri::command]
-fn minimize_window(window: tauri::Window) {
-    let _ = window.minimize();
+fn minimize_window(state: tauri::State<'_, AppState>) {
+    state.core.minimize_window();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 1. Initialize configuration
+    // 1. Initialize configuration storage
     crate::config::init();
-
-    let app_config = crate::config::get_config();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            current_view: Mutex::new("launcher".to_string()),
-            hid_manager: crate::hid::HidManager::new(),
-        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             scan_hid,
@@ -197,11 +178,37 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
-            // Synchronize GNOME custom shortcuts on startup
-            let keys: Vec<String> = app_config.quick_start_binds.keys().cloned().collect();
-            let _ = crate::gnome_shortcuts::sync_gnome_shortcuts(&keys);
+            // Instantiate concrete adapters
+            let config_repo = Arc::new(crate::config::FsConfigRepository);
+            let gnome_shortcuts = Arc::new(crate::gnome_shortcuts::GSettingsGnomeShortcutsService);
+            let app_launcher = Arc::new(crate::apps::ProcessAppLauncher);
+            let autostart_manager = Arc::new(crate::autostart::AutoLaunchManager);
+            let trigger_ipc = Arc::new(crate::trigger_ipc::TcpTriggerIpcService);
+            let ws_server = Arc::new(crate::bridge_ws::TungsteniteWsServer::new());
+            let hid_service = Arc::new(crate::hid::HidApiService);
+            let window_service = Arc::new(TauriWindowService::new(app_handle.clone()));
+
+            let core = Arc::new(crate::domain::FlickCore::new(
+                config_repo,
+                gnome_shortcuts,
+                app_launcher,
+                autostart_manager,
+                trigger_ipc,
+                ws_server,
+                hid_service,
+                window_service,
+            ));
+
+            // Run core initialization
+            core.init_app();
+
+            app.manage(AppState {
+                core: core.clone(),
+                hid_manager: crate::hid::HidManager::new(),
+            });
 
             // 2. Setup System Tray
+            let app_config = core.get_config();
             let lang = &app_config.language;
             let is_en = lang == "en";
             let settings_label = if is_en { "Open Settings" } else { "Abrir Configurações" };
@@ -238,6 +245,7 @@ pub fn run() {
                 .build(app)?;
 
             // 3. Setup Menu Event Handlers
+            let core_clone = core.clone();
             app.on_menu_event(move |handle, event| {
                 let id = event.id.as_ref();
                 if let Some(main_window) = handle.get_webview_window("main") {
@@ -246,22 +254,18 @@ pub fn run() {
                             let _ = main_window.show();
                             let _ = main_window.set_focus();
                             let _ = main_window.emit("navigate", "settings");
-                            let state = handle.state::<AppState>();
-                            *state.current_view.lock().unwrap() = "settings".to_string();
+                            core_clone.set_current_view("settings");
                         }
                         "launcher" => {
                             let _ = main_window.show();
                             let _ = main_window.set_focus();
                             let _ = main_window.emit("navigate", "launcher");
-                            let state = handle.state::<AppState>();
-                            *state.current_view.lock().unwrap() = "launcher".to_string();
+                            core_clone.set_current_view("launcher");
                         }
                         "autostart" => {
-                            let config = crate::config::get_config();
+                            let config = core_clone.get_config();
                             let new_val = !config.autostart;
-                            crate::autostart::set_autostart_enabled(new_val);
-                            let _ = crate::config::update_config(serde_json::json!({ "autostart": new_val }));
-                            update_tray_menu(handle, new_val);
+                            let _ = core_clone.update_config(serde_json::json!({ "autostart": new_val }));
                         }
                         "quit" => {
                             handle.exit(0);
@@ -271,42 +275,25 @@ pub fn run() {
                 }
             });
 
-            // 4. Start Trigger IPC Server
-            let handle_clone_1 = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                crate::trigger_ipc::start_trigger_server(move |key| {
-                    fire_quick_start(&key, &handle_clone_1);
-                }).await;
-            });
-
-            let port = app_config.ws_port;
-            tauri::async_runtime::spawn(async move {
-                crate::bridge_ws::start_server(port, move || {
-                    let config = crate::config::get_config();
-                    let keys: Vec<String> = config.quick_start_binds.keys().cloned().collect();
-                    let _ = crate::gnome_shortcuts::sync_gnome_shortcuts(&keys);
-                    crate::bridge_ws::broadcast_key_binds();
-                }).await;
-            });
-
-            // 6. Setup HID Manager listener
+            // 4. Setup HID Manager listener
             let state = app_handle.state::<AppState>();
             let (hid_tx, mut hid_rx) = tokio::sync::mpsc::unbounded_channel();
             state.hid_manager.set_sender(hid_tx);
             state.hid_manager.start();
 
+            let core_clone_hid = core.clone();
             let handle_clone_3 = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = hid_rx.recv().await {
                     match event {
                         crate::hid::HidEvent::QuickstartKey { f_key } => {
-                            fire_quick_start(&f_key, &handle_clone_3);
+                            core_clone_hid.handle_key_trigger(&f_key);
                         }
                         crate::hid::HidEvent::AssistKey { key_id, .. } => {
                             if let Some(f_key) = hid_key_id_to_f_key(key_id) {
-                                let config = crate::config::get_config();
+                                let config = core_clone_hid.get_config();
                                 if config.quick_start_binds.contains_key(&f_key) {
-                                    fire_quick_start(&f_key, &handle_clone_3);
+                                    core_clone_hid.handle_key_trigger(&f_key);
                                     continue;
                                 }
                             }
@@ -315,21 +302,20 @@ pub fn run() {
                                 let _ = main_window.show();
                                 let _ = main_window.set_focus();
                                 let _ = main_window.emit("navigate", "launcher");
-                                let state = handle_clone_3.state::<AppState>();
-                                *state.current_view.lock().unwrap() = "launcher".to_string();
+                                core_clone_hid.set_current_view("launcher");
                             }
                         }
                     }
                 }
             });
 
-            // 7. Window Event Handlers (Blur/Focus)
+            // 5. Window Event Handlers (Blur/Focus)
             if let Some(main_window) = app.get_webview_window("main") {
+                let core_clone_blur = core.clone();
                 let handle_clone_4 = app_handle.clone();
                 main_window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        let state = handle_clone_4.state::<AppState>();
-                        let view = state.current_view.lock().unwrap().clone();
+                        let view = core_clone_blur.get_current_view();
                         if view == "launcher" {
                             let _ = handle_clone_4.get_webview_window("main").unwrap().hide();
                         }
@@ -348,10 +334,10 @@ pub fn run() {
                     if let Some(idx) = args.iter().position(|a| a == "--trigger") {
                         if idx + 1 < args.len() {
                             let key = args[idx + 1].clone();
-                            let handle_clone_cold = app_handle.clone();
+                            let core_clone_cold = core.clone();
                             tauri::async_runtime::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                fire_quick_start(&key, &handle_clone_cold);
+                                core_clone_cold.handle_key_trigger(&key);
                             });
                         }
                     }
@@ -393,4 +379,3 @@ mod tests {
         assert_eq!(hid_key_id_to_f_key(255), None);
     }
 }
-

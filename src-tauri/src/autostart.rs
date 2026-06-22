@@ -53,6 +53,17 @@ pub fn is_autostart_enabled() -> bool {
     }
 }
 
+pub struct AutoLaunchManager;
+
+impl crate::ports::AutostartManager for AutoLaunchManager {
+    fn set_enabled(&self, enabled: bool) {
+        set_autostart_enabled(enabled);
+    }
+    fn is_enabled(&self) -> bool {
+        is_autostart_enabled()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
