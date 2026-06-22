@@ -190,6 +190,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_is_gnome_session() {
         // Mock XDG env variable
         std::env::set_var("XDG_CURRENT_DESKTOP", "Ubuntu:GNOME");
