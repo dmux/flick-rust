@@ -16,6 +16,17 @@
 
 ---
 
+## Keychron Assist Alternative & Compatibility
+
+Flick Launcher is a lightweight, high-performance, and open-source alternative to the official **Keychron Assist** software (Keychron Launcher Bridge) for Linux. It implements a compatible WebSocket backend to communicate with the Keychron Launcher web application, letting you bind actions to keys seamlessly.
+
+### Compatibility List
+The following customizable keyboards are officially supported and fully verified over both USB and Bluetooth connections:
+- **Keychron V5 Max**
+- **Keychron K15 Max**
+
+---
+
 ## Features
 
 - **Blazing Fast Launcher**: A responsive, frameless window to search and launch installed desktop applications instantly.
