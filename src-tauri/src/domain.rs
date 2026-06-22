@@ -417,6 +417,12 @@ mod tests {
 
         // 2. Trigger server callback should be set
         assert!(trigger.trigger_callback.lock().unwrap().is_some());
+        {
+            let callback_lock = trigger.trigger_callback.lock().unwrap();
+            if let Some(ref cb) = *callback_lock {
+                cb("F13".to_string());
+            }
+        }
 
         // 3. WS server callbacks should be set
         assert!(ws.get_binds_cb.lock().unwrap().is_some());
@@ -501,6 +507,15 @@ mod tests {
         assert_eq!(*gnome.synced_keys.lock().unwrap(), vec!["F15".to_string()]);
         assert_eq!(ws.broadcasted_binds.lock().unwrap().len(), 1);
         assert_eq!(ws.broadcasted_binds.lock().unwrap()[0].get("F15").unwrap().len(), 1);
+
+        // 4. Update with null / non-object (should not crash, handled gracefully)
+        let _ = core.update_config(serde_json::Value::Null);
+
+        // 5. Update wsPort to 5005 (migrated to default KEYCHRON_WS_PORT)
+        let updated = core.update_config(serde_json::json!({
+            "wsPort": 5005
+        }));
+        assert_eq!(updated.ws_port, crate::config::KEYCHRON_WS_PORT);
     }
 
     #[tokio::test]
@@ -635,5 +650,18 @@ mod tests {
             assert!(relayed);
             assert_eq!(trigger.relays.lock().unwrap()[0], ("FOCUS".to_string(), crate::trigger_ipc::FLICK_TRIGGER_PORT));
         }
+    }
+
+    #[tokio::test]
+    async fn test_mocks_coverage() {
+        let gnome = MockGnomeShortcutsService { synced_keys: Mutex::new(Vec::new()) };
+        assert!(gnome.is_gnome());
+        let _ = gnome.clear_shortcuts();
+
+        let auto = MockAutostartManager { enabled: Mutex::new(true) };
+        assert!(auto.is_enabled());
+
+        let win = MockWindowService { shows: Mutex::new(0), hides: Mutex::new(0), minimizes: Mutex::new(0), resizes: Mutex::new(Vec::new()), tray_updates: Mutex::new(Vec::new()) };
+        win.emit_navigate("launcher");
     }
 }
