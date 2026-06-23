@@ -122,8 +122,10 @@ impl crate::ports::WsServer for TungsteniteWsServer {
         *self.callbacks.write().unwrap() = Some(callbacks_arc);
 
         let callbacks = self.callbacks.clone();
-        let rt = tokio::runtime::Handle::current();
-        rt.spawn(async move {
+        // Use Tauri's managed async runtime instead of `Handle::current()`. This is
+        // called during app setup, outside of any Tokio runtime context, where
+        // `Handle::current()` would panic ("there is no reactor running").
+        tauri::async_runtime::spawn(async move {
             start_server_internal(port, callbacks).await;
         });
     }

@@ -100,8 +100,11 @@ pub struct TcpTriggerIpcService;
 
 impl crate::ports::TriggerIpcService for TcpTriggerIpcService {
     fn start_server(&self, port: u16, on_trigger: Box<dyn Fn(String) + Send + Sync + 'static>) {
-        let rt = tokio::runtime::Handle::current();
-        rt.spawn(async move {
+        // Use Tauri's managed async runtime instead of `Handle::current()`. This is
+        // called from Tauri's `.setup()` closure, which does NOT run inside a Tokio
+        // runtime context, so `Handle::current()` would panic ("there is no reactor
+        // running"). `tauri::async_runtime::spawn` works from any context.
+        tauri::async_runtime::spawn(async move {
             start_trigger_server_on_port(move |key| {
                 on_trigger(key);
             }, port).await;
