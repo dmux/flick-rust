@@ -159,7 +159,11 @@ impl FlickCore {
             for opt in options {
                 let opt = opt.clone();
                 let app_launcher = self.app_launcher.clone();
-                tokio::spawn(async move {
+                // Use a plain thread (not `tokio::spawn`) so this works regardless of
+                // the caller's context. `handle_key_trigger` may run on the main thread
+                // (e.g. from tray/menu events) where no Tokio runtime is active, and the
+                // launch itself is a synchronous, fire-and-forget process spawn.
+                std::thread::spawn(move || {
                     if opt.opt_type == "Url" {
                         app_launcher.launch_url(&opt.opt_data.path);
                     } else {
